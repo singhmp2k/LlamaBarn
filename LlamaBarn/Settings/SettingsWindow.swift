@@ -151,11 +151,11 @@ struct SettingsView: View {
             .foregroundStyle(.secondary)
         }
       }
-      // Optional HF token section
+      // Optional HF access token section
       Section {
         VStack(alignment: .leading, spacing: 8) {
           HStack {
-            Text("HF Token")
+            Text("Hugging Face Token")
             Spacer()
             Button {
               showingHFTokenSheet = true
@@ -170,7 +170,7 @@ struct SettingsView: View {
             .controlSize(.small)
           }
 
-          Text("Optional token that lets you download gated or private models from HF.")
+          Text("Authenticate model downloads; optional.")
             .font(.callout)
             .foregroundStyle(.secondary)
         }
@@ -224,7 +224,7 @@ struct SettingsView: View {
   }
 }
 
-/// Sheet for editing the Hugging Face token.
+/// Sheet for editing the Hugging Face access token.
 struct HFTokenSheet: View {
   let currentToken: String
   let onSave: (String) -> Void
@@ -242,15 +242,11 @@ struct HFTokenSheet: View {
         Text("Hugging Face Token")
           .font(.headline)
 
-        Text("Paste your access token from Hugging Face.")
-          .font(.caption)
-          .foregroundStyle(.secondary)
-
         HStack(spacing: 4) {
-          Text("Don't have a token?")
+          Text("Don't have one?")
             .foregroundStyle(.secondary)
           Link(
-            "Create one \u{2192}",
+            "Create here \u{2192}",
             destination: URL(string: "https://huggingface.co/settings/tokens")!
           )
         }

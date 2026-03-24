@@ -149,7 +149,7 @@ enum UserSettings {
 
   // MARK: - Hugging Face Token
 
-  /// Optional token that lets you download gated or private models from HF.
+  /// Optional token that authenticates downloads from Hugging Face.
   /// Stored in UserDefaults (not Keychain) — fine given most users would use
   /// a fine-grained token with minimal permissions.
   static var hfToken: String? {

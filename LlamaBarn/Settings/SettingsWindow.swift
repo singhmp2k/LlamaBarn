@@ -146,7 +146,7 @@ struct SettingsView: View {
             .fixedSize()
           }
 
-          Text("Where downloaded models are stored. Shared with llama.cpp.")
+          Text("Where downloaded models are stored.")
             .font(.callout)
             .foregroundStyle(.secondary)
         }

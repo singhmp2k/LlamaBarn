@@ -103,8 +103,9 @@ final class MenuController: NSObject, NSMenuDelegate {
     menu.addItem(NSMenuItem.viewItem(with: view))
     menu.addItem(NSMenuItem.viewItem(with: SeparatorView()))
 
-    // Show warning if custom models folder is unavailable (e.g., external drive unplugged)
-    if UserSettings.hasCustomModelStorageDirectory && !UserSettings.isModelStorageDirectoryAvailable
+    // Show warning if custom cache directory is unavailable (e.g., external drive unplugged)
+    if UserSettings.hasCustomHFCacheDirectory
+      && !FileManager.default.fileExists(atPath: UserSettings.hfCacheDirectory.path)
     {
       addFolderWarning(to: menu)
     }
@@ -422,7 +423,7 @@ final class MenuController: NSObject, NSMenuDelegate {
   /// Adds a warning when the custom models folder is unavailable (e.g., external drive unplugged)
   private func addFolderWarning(to menu: NSMenu) {
     let warningView = TextItemView(
-      text: "Models folder not available. Check Settings.",
+      text: "Cache directory not available. Check Settings.",
       style: .description,
       onAction: { [weak self] in
         self?.openSettings()

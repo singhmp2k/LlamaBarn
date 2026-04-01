@@ -101,9 +101,10 @@ struct CatalogEntry: Identifiable {
     return runtimeMemoryUsageMb(ctxWindowTokens: maxTokens)
   }
 
-  /// The local file system path where the model file will be stored
-  var modelFilePath: String {
-    Self.modelStorageDirectory.appendingPathComponent(downloadUrl.lastPathComponent).path
+  /// The legacy flat-directory path for the model file (~/.llamabarn/{filename}).
+  /// Used for backward compat scanning of pre-HF-cache installs.
+  var legacyModelFilePath: String {
+    Self.legacyStorageDir.appendingPathComponent(downloadUrl.lastPathComponent).path
   }
 
   /// The URL to the model's page on Hugging Face
@@ -122,11 +123,12 @@ struct CatalogEntry: Identifiable {
       .deletingLastPathComponent()
   }
 
-  /// The local file system path where the mmproj file will be stored, if applicable
-  var mmprojFilePath: String? {
+  /// The legacy flat-directory path for the mmproj file, if applicable.
+  /// Uses mmprojLocalFilename override to prevent collisions in the flat directory.
+  var legacyMmprojFilePath: String? {
     guard let mmprojUrl = mmprojUrl else { return nil }
     let filename = mmprojLocalFilename ?? mmprojUrl.lastPathComponent
-    return Self.modelStorageDirectory.appendingPathComponent(filename).path
+    return Self.legacyStorageDir.appendingPathComponent(filename).path
   }
 
   /// Returns the local filename that should be used for a given remote download URL.
@@ -138,16 +140,16 @@ struct CatalogEntry: Identifiable {
     return remoteUrl.lastPathComponent
   }
 
-  /// All local file paths this model requires (main file + additional parts like shards or mmproj files)
-  var allLocalModelPaths: [String] {
-    let baseDir = URL(fileURLWithPath: modelFilePath).deletingLastPathComponent()
-    var paths = [modelFilePath]
+  /// All legacy flat-directory paths this model requires (main + shards + mmproj).
+  var legacyLocalPaths: [String] {
+    let baseDir = URL(fileURLWithPath: legacyModelFilePath).deletingLastPathComponent()
+    var paths = [legacyModelFilePath]
     if let additional = additionalParts {
       for url in additional {
         paths.append(baseDir.appendingPathComponent(url.lastPathComponent).path)
       }
     }
-    if let mmprojPath = mmprojFilePath {
+    if let mmprojPath = legacyMmprojFilePath {
       paths.append(mmprojPath)
     }
     return paths
@@ -165,10 +167,16 @@ struct CatalogEntry: Identifiable {
     return urls
   }
 
-  /// The directory where AI models are stored.
-  /// Reads from UserSettings, which handles directory creation.
-  static var modelStorageDirectory: URL {
-    UserSettings.modelStorageDirectory
+  /// The legacy flat directory for models (~/.llamabarn/).
+  /// Used for backward compat scanning and as llama-server working directory.
+  static var legacyStorageDir: URL {
+    UserSettings.legacyModelDir
+  }
+
+  /// The HF cache repo directory name for this model (e.g. "models--unsloth--Qwen3.5-2B-GGUF").
+  /// Derived from the download URL. Returns nil for non-HF URLs.
+  var hfRepoDir: String? {
+    HFCache.repoDirName(from: downloadUrl)
   }
 
   /// Groups models by family, then by model size (e.g., 2B, 4B), then full-precision before quantized variants.

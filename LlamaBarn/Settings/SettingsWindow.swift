@@ -64,7 +64,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 struct SettingsView: View {
   @State private var launchAtLogin = LaunchAtLogin.isEnabled
   @State private var sleepIdleTime = UserSettings.sleepIdleTime
-  @State private var modelStorageDir = UserSettings.modelStorageDirectory
+  @State private var hfCacheDir = UserSettings.hfCacheDirectory
   @State private var hfToken = UserSettings.hfToken ?? ""
   @State private var showingHFTokenSheet = false
 
@@ -100,20 +100,20 @@ struct SettingsView: View {
         }
       }
 
-      // Model storage directory section
+      // HF cache directory section
       Section {
         VStack(alignment: .leading, spacing: 8) {
           // Manual HStack instead of LabeledContent so the path can
           // shrink via truncation and everything stays on one line.
           HStack(spacing: 6) {
-            Text("Models folder")
+            Text("Cache directory")
               .fixedSize()
 
             Spacer()
 
             // Path text -- layoutPriority -1 lets it shrink first
             // so buttons stay on the same line
-            Text(abbreviatedPath(modelStorageDir))
+            Text(abbreviatedPath(hfCacheDir))
               .font(.callout)
               .foregroundStyle(.secondary)
               .textSelection(.enabled)
@@ -122,10 +122,10 @@ struct SettingsView: View {
               .layoutPriority(-1)
 
             // Show restore button only when using custom directory
-            if UserSettings.hasCustomModelStorageDirectory {
+            if UserSettings.hasCustomHFCacheDirectory {
               Button {
-                UserSettings.modelStorageDirectory = UserSettings.defaultModelStorageDirectory
-                modelStorageDir = UserSettings.modelStorageDirectory
+                UserSettings.hfCacheDirectory = UserSettings.defaultHFCacheDirectory
+                hfCacheDir = UserSettings.hfCacheDirectory
                 ModelManager.shared.refreshDownloadedModels()
               } label: {
                 // Unicode counterclockwise arrow -- renders at the same
@@ -134,19 +134,19 @@ struct SettingsView: View {
               }
               .font(.callout)
               .controlSize(.small)
-              .help("Restore default folder")
+              .help("Restore default directory")
               .fixedSize()
             }
 
             Button("Select...") {
-              chooseModelFolder()
+              chooseCacheFolder()
             }
             .font(.callout)
             .controlSize(.small)
             .fixedSize()
           }
 
-          Text("Existing models won't be moved automatically.")
+          Text("Where downloaded models are stored. Shared with llama.cpp.")
             .font(.callout)
             .foregroundStyle(.secondary)
         }
@@ -187,22 +187,22 @@ struct SettingsView: View {
     .fixedSize()
   }
 
-  /// Opens a folder picker and updates the model storage directory
-  private func chooseModelFolder() {
+  /// Opens a folder picker and updates the HF cache directory
+  private func chooseCacheFolder() {
     let panel = NSOpenPanel()
     panel.canChooseFiles = false
     panel.canChooseDirectories = true
     panel.canCreateDirectories = true
     panel.allowsMultipleSelection = false
-    panel.message = "Choose a folder for storing AI models"
+    panel.message = "Choose a cache directory for AI models"
     panel.prompt = "Select"
 
-    // Start in the current model storage directory
-    panel.directoryURL = modelStorageDir
+    // Start in the current cache directory
+    panel.directoryURL = hfCacheDir
 
     if panel.runModal() == .OK, let url = panel.url {
-      UserSettings.modelStorageDirectory = url
-      modelStorageDir = url
+      UserSettings.hfCacheDirectory = url
+      hfCacheDir = url
       ModelManager.shared.refreshDownloadedModels()
     }
   }

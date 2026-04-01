@@ -58,7 +58,8 @@ class LlamaServer {
   var state: ServerState = .idle {
     didSet { NotificationCenter.default.post(name: .LBServerStateDidChange, object: self) }
   }
-  var activeModelPath: String?
+  /// The ID of the currently active (loaded) model, or nil if no model is loaded.
+  var activeModelId: String?
   var modelStatuses: [String: String] = [:] {
     didSet { NotificationCenter.default.post(name: .LBModelStatusDidChange, object: self) }
   }
@@ -148,11 +149,15 @@ class LlamaServer {
 
     state = .loading
 
-    let presetsPath = CatalogEntry.modelStorageDirectory.appendingPathComponent("models.ini").path
+    let presetsPath = CatalogEntry.legacyStorageDir.appendingPathComponent("models.ini").path
 
     let llamaServerPath = libFolderPath + "/llama-server"
 
-    let env = ["GGML_METAL_NO_RESIDENCY": "1"]
+    let env = [
+      "GGML_METAL_NO_RESIDENCY": "1",
+      // Set HF_HUB_CACHE so llama-server can find models in the HF cache layout
+      "HF_HUB_CACHE": UserSettings.hfCacheDirectory.path,
+    ]
 
     var arguments = [
       "--models-preset", presetsPath,
@@ -175,7 +180,7 @@ class LlamaServer {
       ])
     }
 
-    let workingDirectory = CatalogEntry.modelStorageDirectory.path
+    let workingDirectory = CatalogEntry.legacyStorageDir.path
 
     let process = Process()
     process.executableURL = URL(fileURLWithPath: llamaServerPath)
@@ -216,7 +221,7 @@ class LlamaServer {
       let errorMessage = "Process launch failed: \(error.localizedDescription)"
       logger.error("Failed to launch process: \(error)")
       self.state = .error(.launchFailed(errorMessage))
-      self.activeModelPath = nil
+      self.activeModelId = nil
       return
     }
     startStatusPolling(port: port)
@@ -228,7 +233,7 @@ class LlamaServer {
     memoryUsageMb = 0
     state = .idle
 
-    activeModelPath = nil
+    activeModelId = nil
 
     cleanUpResources()
   }
@@ -330,7 +335,7 @@ class LlamaServer {
 
     // In Router Mode, the model is loaded via the /models/load endpoint.
     // We update local state so the UI knows what's selected.
-    self.activeModelPath = model.modelFilePath
+    self.activeModelId = model.id
     logger.info("Requested active model: \(model.displayName)")
   }
 
@@ -345,8 +350,8 @@ class LlamaServer {
       _ = await api.unloadModel(id: idToUnload)
     }
 
-    if activeModelPath == model.modelFilePath {
-      activeModelPath = nil
+    if activeModelId == model.id {
+      activeModelId = nil
     }
   }
 
@@ -388,8 +393,8 @@ class LlamaServer {
         if isSleeping {
           _ = await api.unloadModel(id: loadedModelId)
           await MainActor.run {
-            if self.activeModelPath != nil {
-              self.activeModelPath = nil
+            if self.activeModelId != nil {
+              self.activeModelId = nil
             }
           }
         }

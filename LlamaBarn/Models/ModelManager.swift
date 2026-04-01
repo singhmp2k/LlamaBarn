@@ -16,6 +16,11 @@ class ModelManager: NSObject, URLSessionDownloadDelegate {
 
   var downloadedModels: [CatalogEntry] = []
 
+  /// Resolved file paths for each downloaded model, keyed by model ID.
+  /// Populated during refreshDownloadedModels(). Used for models.ini generation,
+  /// deletion, and determining which files need downloading.
+  var resolvedPaths: [String: ResolvedPaths] = [:]
+
   /// Returns a sorted list of all models that are either installed or currently downloading.
   /// This is the primary list shown in the "Installed" section of the menu.
   var managedModels: [CatalogEntry] {
@@ -27,6 +32,11 @@ class ModelManager: NSObject, URLSessionDownloadDelegate {
   }
 
   var activeDownloads: [String: ActiveDownload] = [:]
+
+  /// HF download context per model ID, gathered before download starts.
+  /// Contains commit hash and blob hashes needed to write into HF cache layout.
+  /// Nil for legacy flat-directory downloads (fallback when HF API calls fail).
+  var downloadContexts: [String: HFDownloadCtx] = [:]
 
   // Store resume data for failed downloads to allow resuming later
   private var resumeData: [URL: Data] = [:]
@@ -60,7 +70,9 @@ class ModelManager: NSObject, URLSessionDownloadDelegate {
     refreshDownloadedModels()
   }
 
-  /// Downloads all required files for a model
+  /// Downloads all required files for a model.
+  /// Fetches HF metadata (commit hash, blob hashes) first, then starts URLSession tasks.
+  /// Falls back to legacy flat download if HF API calls fail.
   func downloadModel(_ model: CatalogEntry) throws {
     // Prevent duplicate downloads if user clicks download multiple times or if called from multiple code paths.
     // Without this check, we'd start redundant URLSession tasks, waste bandwidth, and corrupt download state.
@@ -74,7 +86,25 @@ class ModelManager: NSObject, URLSessionDownloadDelegate {
 
     logger.info("Starting download for model: \(model.displayName)")
 
-    // Publish aggregate before starting tasks to avoid race with delegate callbacks
+    // Fetch HF metadata before starting download tasks.
+    // This determines where files will be stored (HF cache vs legacy flat).
+    let modelId = model.id
+    Task {
+      let ctx = await self.fetchHFContext(for: model)
+      await MainActor.run {
+        if let ctx {
+          self.downloadContexts[modelId] = ctx
+          self.logger.info("HF context ready for \(model.displayName): \(ctx.repoDir)")
+        } else {
+          self.logger.info("No HF context for \(model.displayName), using legacy download")
+        }
+        self.startDownloadTasks(model: model, files: filesToDownload)
+      }
+    }
+  }
+
+  /// Starts URLSession download tasks for the given files.
+  private func startDownloadTasks(model: CatalogEntry, files: [URL]) {
     let modelId = model.id
     let totalUnitCount = max(remainingBytesRequired(for: model), 1)
     var aggregate = ActiveDownload(
@@ -84,7 +114,7 @@ class ModelManager: NSObject, URLSessionDownloadDelegate {
       completedFilesBytes: 0
     )
 
-    for fileUrl in filesToDownload {
+    for fileUrl in files {
       let task: URLSessionDownloadTask
       if let data = resumeData[fileUrl] {
         logger.info("Resuming download for \(fileUrl.lastPathComponent)")
@@ -102,6 +132,33 @@ class ModelManager: NSObject, URLSessionDownloadDelegate {
     postDownloadsDidChange()
   }
 
+  /// Fetches HF commit hash and blob SHA256 hashes for a model.
+  /// Returns nil if any required API call fails (caller should fall back to legacy).
+  private nonisolated func fetchHFContext(for model: CatalogEntry) async -> HFDownloadCtx? {
+    guard let info = HFCache.orgAndRepo(from: model.downloadUrl),
+      let repoDir = HFCache.repoDirName(from: model.downloadUrl)
+    else { return nil }
+
+    let token = await MainActor.run { UserSettings.hfToken }
+
+    do {
+      let commit = try await HFCache.fetchCommitHash(
+        org: info.org, repo: info.repo, token: token)
+
+      // Fetch blob hashes for all files
+      var blobHashes: [URL: String] = [:]
+      for url in model.allDownloadUrls {
+        if let hash = try? await HFCache.fetchBlobSHA256(for: url, token: token) {
+          blobHashes[url] = hash
+        }
+      }
+
+      return HFDownloadCtx(repoDir: repoDir, commit: commit, blobHashes: blobHashes)
+    } catch {
+      return nil
+    }
+  }
+
   /// Gets the current status of a model.
   func status(for model: CatalogEntry) -> ModelStatus {
     if downloadedModels.contains(where: { $0.id == model.id }) {
@@ -117,16 +174,17 @@ class ModelManager: NSObject, URLSessionDownloadDelegate {
   func deleteDownloadedModel(_ model: CatalogEntry) {
     cancelModelDownload(model)
 
-    // Clear active model path if we're deleting the active model
+    // Clear active model if we're deleting the active model
     let llamaServer = LlamaServer.shared
-    if llamaServer.activeModelPath == model.modelFilePath {
-      llamaServer.activeModelPath = nil
+    if llamaServer.activeModelId == model.id {
+      llamaServer.activeModelId = nil
     }
 
-    let paths = model.allLocalModelPaths
+    let paths = resolvedPaths[model.id]
 
     // Optimistically update state immediately for responsive UI
     downloadedModels.removeAll { $0.id == model.id }
+    resolvedPaths.removeValue(forKey: model.id)
     if updateModelsFile() {
       LlamaServer.shared.reload()
     }
@@ -136,10 +194,21 @@ class ModelManager: NSObject, URLSessionDownloadDelegate {
     let logger = self.logger
     Task.detached {
       do {
-        // Delete files
-        for path in paths {
-          if FileManager.default.fileExists(atPath: path) {
-            try FileManager.default.removeItem(atPath: path)
+        if let paths {
+          if paths.isLegacy {
+            // Legacy: delete files directly
+            for path in paths.allPaths {
+              if FileManager.default.fileExists(atPath: path) {
+                try FileManager.default.removeItem(atPath: path)
+              }
+            }
+          } else if let repoDir = model.hfRepoDir {
+            // HF cache: delete blobs via symlinks, clean up empty dirs
+            try HFCache.deleteModelFiles(
+              cacheDir: UserSettings.hfCacheDirectory,
+              repoDir: repoDir,
+              paths: paths
+            )
           }
         }
       } catch {
@@ -155,10 +224,8 @@ class ModelManager: NSObject, URLSessionDownloadDelegate {
     let manager = ModelManager.shared
     manager.downloadedModels.append(model)
     manager.downloadedModels.sort(by: CatalogEntry.displayOrder(_:_:))
-    if manager.updateModelsFile() {
-      LlamaServer.shared.reload()
-    }
-    NotificationCenter.default.post(name: .LBModelDownloadedListDidChange, object: manager)
+    // Re-scan to rebuild resolvedPaths
+    manager.refreshDownloadedModels()
     logger.error("Failed to delete model: \(error.localizedDescription)")
   }
 
@@ -167,7 +234,7 @@ class ModelManager: NSObject, URLSessionDownloadDelegate {
   @discardableResult
   func updateModelsFile() -> Bool {
     let content = generateModelsFileContent()
-    let destinationURL = CatalogEntry.modelStorageDirectory.appendingPathComponent("models.ini")
+    let destinationURL = CatalogEntry.legacyStorageDir.appendingPathComponent("models.ini")
 
     // Skip write if content is identical
     if let existingData = try? Data(contentsOf: destinationURL),
@@ -194,17 +261,26 @@ class ModelManager: NSObject, URLSessionDownloadDelegate {
       // Use the effective tier (user selection or max compatible)
       guard let tier = model.effectiveCtxTier else { continue }
 
-      // Use relative paths (just filenames) since llama-server runs with
-      // working directory set to the models folder. This allows the folder
-      // to be moved without breaking the config.
-      let modelFilename = model.downloadUrl.lastPathComponent
+      let paths = resolvedPaths[model.id]
+
+      // For HF cache models: use absolute snapshot path (symlink with human-readable filename).
+      // For legacy models: use relative filename (llama-server CWD is ~/.llamabarn/).
+      let modelPath: String
+      let mmprojPath: String?
+      if let paths, !paths.isLegacy {
+        modelPath = paths.modelFile
+        mmprojPath = paths.mmprojFile
+      } else {
+        modelPath = model.downloadUrl.lastPathComponent
+        mmprojPath = model.mmprojUrl.map { model.localFilename(for: $0) }
+      }
 
       content += "[\(model.id)]\n"
-      content += "model = \(modelFilename)\n"
+      content += "model = \(modelPath)\n"
       content += "ctx-size = \(tier.rawValue)\n"
 
-      if let mmprojUrl = model.mmprojUrl {
-        content += "mmproj = \(model.localFilename(for: mmprojUrl))\n"
+      if let mmprojPath {
+        content += "mmproj = \(mmprojPath)\n"
       }
 
       // Enable larger batch size for better performance on high-memory devices (>=32 GB RAM)
@@ -244,46 +320,80 @@ class ModelManager: NSObject, URLSessionDownloadDelegate {
     return content
   }
 
-  /// Scans the local models directory and updates the list of downloaded models.
+  /// Scans both the legacy directory and HF cache for installed models.
   func refreshDownloadedModels() {
-    let modelsDir = CatalogEntry.modelStorageDirectory
+    let legacyDir = CatalogEntry.legacyStorageDir
+    let hfCacheDir = UserSettings.hfCacheDirectory
+    let allCatalogModels = Catalog.allModels()
 
     // Move directory reading to background queue to avoid blocking main thread
     Task.detached {
-      let downloaded: [CatalogEntry]
-      if let files = try? FileManager.default.contentsOfDirectory(atPath: modelsDir.path) {
-        let fileSet = Set(files)
-        downloaded = Catalog.allModels().filter { model in
-          let mainFile = model.downloadUrl.lastPathComponent
-          if !fileSet.contains(mainFile) { return false }
+      var allResolved: [String: ResolvedPaths] = [:]
 
+      // 1. Scan legacy directory (~/.llamabarn/) for flat .gguf files
+      if let files = try? FileManager.default.contentsOfDirectory(atPath: legacyDir.path) {
+        let fileSet = Set(files)
+        for model in allCatalogModels {
+          let mainFile = model.downloadUrl.lastPathComponent
+          guard fileSet.contains(mainFile) else { continue }
+
+          // Check additional parts (shards)
+          var partsFound = true
+          var partPaths: [String] = []
           if let additionalParts = model.additionalParts {
             for part in additionalParts {
-              if !fileSet.contains(part.lastPathComponent) { return false }
+              if fileSet.contains(part.lastPathComponent) {
+                partPaths.append(legacyDir.appendingPathComponent(part.lastPathComponent).path)
+              } else {
+                partsFound = false
+                break
+              }
+            }
+          }
+          guard partsFound else { continue }
+
+          // Check mmproj file (uses localFilename override for legacy flat dir)
+          var mmprojPath: String?
+          if let mmprojUrl = model.mmprojUrl {
+            let mmprojFile = model.localFilename(for: mmprojUrl)
+            if fileSet.contains(mmprojFile) {
+              mmprojPath = legacyDir.appendingPathComponent(mmprojFile).path
+            } else {
+              continue
             }
           }
 
-          // Vision models require their mmproj file to be present
-          if let mmprojUrl = model.mmprojUrl {
-            let mmprojFile = model.localFilename(for: mmprojUrl)
-            if !fileSet.contains(mmprojFile) { return false }
-          }
-
-          return true
+          allResolved[model.id] = ResolvedPaths(
+            modelFile: legacyDir.appendingPathComponent(mainFile).path,
+            additionalParts: partPaths,
+            mmprojFile: mmprojPath,
+            isLegacy: true
+          )
         }
-      } else {
-        downloaded = []
       }
 
+      // 2. Scan HF cache directory — overwrites legacy entries (HF cache is canonical)
+      let hfResults = HFCache.scanForModels(cacheDir: hfCacheDir, catalog: allCatalogModels)
+      for (modelId, paths) in hfResults {
+        allResolved[modelId] = paths
+      }
+
+      // 3. Build downloaded models list from resolved paths
+      let finalResolved = allResolved
+      let downloaded = allCatalogModels.filter { finalResolved[$0.id] != nil }
+
       await MainActor.run {
-        Self.updateDownloadedModels(downloaded)
+        Self.updateDownloadedModels(downloaded, resolved: finalResolved)
       }
     }
   }
 
-  private static func updateDownloadedModels(_ models: [CatalogEntry]) {
+  private static func updateDownloadedModels(
+    _ models: [CatalogEntry], resolved: [String: ResolvedPaths]
+  ) {
     let manager = ModelManager.shared
     manager.downloadedModels = models.sorted(by: CatalogEntry.displayOrder(_:_:))
+    manager.resolvedPaths = resolved
 
     // Only reload server if models.ini actually changed
     if manager.updateModelsFile() {
@@ -299,6 +409,7 @@ class ModelManager: NSObject, URLSessionDownloadDelegate {
       cancelTasks(for: model.id)
       activeDownloads.removeValue(forKey: model.id)
       lastNotificationTime.removeValue(forKey: model.id)
+      downloadContexts.removeValue(forKey: model.id)
 
       // Clear retry state for all URLs associated with this model
       for url in model.allDownloadUrls {
@@ -365,27 +476,28 @@ class ModelManager: NSObject, URLSessionDownloadDelegate {
     }
 
     let fileManager = FileManager.default
-    let baseDir = URL(fileURLWithPath: model.modelFilePath).deletingLastPathComponent()
     let remoteUrl = downloadTask.originalRequest?.url
     let filename: String
     if let remoteUrl = remoteUrl {
-      filename = model.localFilename(for: remoteUrl)
+      // For HF cache, always use the original remote filename (no localFilename override)
+      // For legacy, use localFilename which handles mmprojLocalFilename overrides
+      let ctx = DispatchQueue.main.sync { self.downloadContexts[modelId] }
+      if ctx != nil {
+        filename = remoteUrl.lastPathComponent
+      } else {
+        filename = model.localFilename(for: remoteUrl)
+      }
     } else {
-      filename = URL(fileURLWithPath: model.modelFilePath).lastPathComponent
+      filename = model.downloadUrl.lastPathComponent
     }
-    let destinationURL = baseDir.appendingPathComponent(filename)
 
     // This callback runs on a background queue, so we can do blocking file operations safely.
     // URLSession's temp file is deleted when this callback returns, so we must move it before returning.
     do {
-      if fileManager.fileExists(atPath: destinationURL.path) {
-        try fileManager.removeItem(at: destinationURL)
-      }
-      try fileManager.moveItem(at: location, to: destinationURL)
-
+      // Check file size first (sanity check before moving)
       let fileSize =
         (try? FileManager.default.attributesOfItem(
-          atPath: destinationURL.path)[.size] as? NSNumber)?.int64Value ?? 0
+          atPath: location.path)[.size] as? NSNumber)?.int64Value ?? 0
 
       // Sanity check: reject obviously broken downloads (error pages, empty files).
       // We don't check for exact size match because:
@@ -394,15 +506,48 @@ class ModelManager: NSObject, URLSessionDownloadDelegate {
       // The 1 MB threshold catches garbage responses without being brittle.
       let minThreshold = Int64(1_000_000)
       if fileSize <= minThreshold {
-        try? fileManager.removeItem(at: destinationURL)
         handleDownloadFailure(
           modelId: modelId,
           model: model,
-          tempLocation: nil,
-          destinationURL: destinationURL,
+          tempLocation: location,
+          destinationURL: nil,
           reason: "file too small (\(fileSize) B)"
         )
         return
+      }
+
+      // Determine destination based on whether we have HF context
+      let ctx = DispatchQueue.main.sync { self.downloadContexts[modelId] }
+
+      if let ctx {
+        // HF cache layout: write blob + snapshot symlink
+        let cacheDir = DispatchQueue.main.sync { UserSettings.hfCacheDirectory }
+
+        // Get pre-fetched blob hash, or compute SHA256 as fallback
+        let blobHash: String
+        if let hash = ctx.blobHashes[remoteUrl ?? model.downloadUrl] {
+          blobHash = hash
+        } else {
+          blobHash = try HFCache.computeSHA256(of: location)
+        }
+
+        try HFCache.writeBlobAndLink(
+          cacheDir: cacheDir,
+          repoDir: ctx.repoDir,
+          commit: ctx.commit,
+          blobHash: blobHash,
+          filename: filename,
+          from: location
+        )
+      } else {
+        // Legacy flat download: move to ~/.llamabarn/{filename}
+        let baseDir = URL(fileURLWithPath: model.legacyModelFilePath).deletingLastPathComponent()
+        let destinationURL = baseDir.appendingPathComponent(filename)
+
+        if fileManager.fileExists(atPath: destinationURL.path) {
+          try fileManager.removeItem(at: destinationURL)
+        }
+        try fileManager.moveItem(at: location, to: destinationURL)
       }
 
       // Update state on main queue (activeDownloads dict must be accessed from main queue)
@@ -421,12 +566,13 @@ class ModelManager: NSObject, URLSessionDownloadDelegate {
 
         if wasCompleted {
           self.logger.info("All downloads completed for model: \(model.displayName)")
+          self.downloadContexts.removeValue(forKey: modelId)
           self.refreshDownloadedModels()
         }
         self.postDownloadsDidChange()
       }
     } catch {
-      logger.error("Error moving downloaded file: \(error.localizedDescription)")
+      logger.error("Error handling downloaded file: \(error.localizedDescription)")
       DispatchQueue.main.async { [weak self] in
         guard let self = self else { return }
         _ = self.updateActiveDownload(modelId: modelId) { aggregate in
@@ -656,6 +802,7 @@ class ModelManager: NSObject, URLSessionDownloadDelegate {
       cancelTasks(for: modelId)
       activeDownloads.removeValue(forKey: modelId)
       lastNotificationTime.removeValue(forKey: modelId)
+      downloadContexts.removeValue(forKey: modelId)
     }
   }
 
@@ -671,34 +818,76 @@ class ModelManager: NSObject, URLSessionDownloadDelegate {
     return filesToDownload
   }
 
-  /// Determines which files need downloading for the given model
+  /// Determines which files need downloading for the given model.
+  /// Checks both legacy and HF cache locations.
   private func filesRequired(for model: CatalogEntry) -> [URL] {
+    // If model is already resolved (installed), no files needed
+    if resolvedPaths[model.id] != nil {
+      return []
+    }
+
     var files: [URL] = []
 
-    // Main model file
-    if !FileManager.default.fileExists(atPath: model.modelFilePath) {
+    // Main model file — check both legacy and HF cache
+    let legacyExists = FileManager.default.fileExists(atPath: model.legacyModelFilePath)
+    let hfExists = hfFileExists(model: model, url: model.downloadUrl)
+    if !legacyExists && !hfExists {
       files.append(model.downloadUrl)
     }
 
     // Additional shards
     if let additional = model.additionalParts, !additional.isEmpty {
-      let baseDir = URL(fileURLWithPath: model.modelFilePath).deletingLastPathComponent()
+      let legacyBaseDir = URL(fileURLWithPath: model.legacyModelFilePath)
+        .deletingLastPathComponent()
       for url in additional {
-        let path = baseDir.appendingPathComponent(url.lastPathComponent).path
-        if !FileManager.default.fileExists(atPath: path) {
+        let legacyPath = legacyBaseDir.appendingPathComponent(url.lastPathComponent).path
+        let legacyPartExists = FileManager.default.fileExists(atPath: legacyPath)
+        let hfPartExists = hfFileExists(model: model, url: url)
+        if !legacyPartExists && !hfPartExists {
           files.append(url)
         }
       }
     }
 
     // Multimodal projection file
-    if let mmprojPath = model.mmprojFilePath, let mmprojUrl = model.mmprojUrl {
-      if !FileManager.default.fileExists(atPath: mmprojPath) {
+    if let mmprojUrl = model.mmprojUrl {
+      let legacyMmprojExists: Bool
+      if let legacyPath = model.legacyMmprojFilePath {
+        legacyMmprojExists = FileManager.default.fileExists(atPath: legacyPath)
+      } else {
+        legacyMmprojExists = false
+      }
+      let hfMmprojExists = hfFileExists(model: model, url: mmprojUrl)
+      if !legacyMmprojExists && !hfMmprojExists {
         files.append(mmprojUrl)
       }
     }
 
     return files
+  }
+
+  /// Checks if a file exists in the HF cache for a given model and remote URL.
+  private func hfFileExists(model: CatalogEntry, url: URL) -> Bool {
+    guard let repoDir = model.hfRepoDir else { return false }
+    let cacheDir = UserSettings.hfCacheDirectory
+    let filename = url.lastPathComponent
+    let snapshotsDir =
+      cacheDir
+      .appendingPathComponent(repoDir)
+      .appendingPathComponent("snapshots")
+
+    guard let commits = try? FileManager.default.contentsOfDirectory(atPath: snapshotsDir.path)
+    else {
+      return false
+    }
+
+    for commit in commits {
+      let filePath = snapshotsDir.appendingPathComponent(commit).appendingPathComponent(filename)
+      if FileManager.default.fileExists(atPath: filePath.path) {
+        return true
+      }
+    }
+    return false
   }
 
   private func validateCompatibility(for model: CatalogEntry) throws {
@@ -711,7 +900,15 @@ class ModelManager: NSObject, URLSessionDownloadDelegate {
   }
 
   private func remainingBytesRequired(for model: CatalogEntry) -> Int64 {
-    let existingBytes: Int64 = model.allLocalModelPaths.reduce(0) { sum, path in
+    // Use resolved paths if available, otherwise fall back to legacy paths
+    let paths: [String]
+    if let resolved = resolvedPaths[model.id] {
+      paths = resolved.allPaths
+    } else {
+      paths = model.legacyLocalPaths
+    }
+
+    let existingBytes: Int64 = paths.reduce(0) { sum, path in
       guard FileManager.default.fileExists(atPath: path),
         let attrs = try? FileManager.default.attributesOfItem(atPath: path),
         let size = (attrs[.size] as? NSNumber)?.int64Value
@@ -724,8 +921,9 @@ class ModelManager: NSObject, URLSessionDownloadDelegate {
   private func validateDiskSpace(for model: CatalogEntry, remainingBytes: Int64) throws {
     guard remainingBytes > 0 else { return }
 
-    let modelsDir = URL(fileURLWithPath: model.modelFilePath).deletingLastPathComponent()
-    let available = DiskSpace.availableBytes(at: modelsDir)
+    // Check disk space at the HF cache directory (where new downloads go)
+    let targetDir = UserSettings.hfCacheDirectory
+    let available = DiskSpace.availableBytes(at: targetDir)
 
     if available > 0 && remainingBytes > available {
       let needStr = Format.gigabytes(remainingBytes)

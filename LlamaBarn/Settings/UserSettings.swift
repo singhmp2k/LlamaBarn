@@ -23,7 +23,8 @@ enum UserSettings {
     static let exposeToNetwork = "exposeToNetwork"
     static let sleepIdleTime = "sleepIdleTime"
     static let selectedCtxTiers = "selectedCtxTiers"
-    static let modelStorageDirectory = "modelStorageDirectory"
+    static let modelStorageDirectory = "modelStorageDirectory"  // legacy, kept for backward compat
+    static let hfCacheDirectory = "hfCacheDirectory"
     static let hfToken = "hfToken"
   }
 
@@ -98,24 +99,41 @@ enum UserSettings {
     NotificationCenter.default.post(name: .LBUserSettingsDidChange, object: nil)
   }
 
-  // MARK: - Model Storage Directory
+  // MARK: - Legacy Model Directory
 
-  /// The default directory for storing models (~/.llamabarn)
-  static let defaultModelStorageDirectory: URL = {
-    FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(
-      ".llamabarn", isDirectory: true)
+  /// The legacy flat directory for models (~/.llamabarn).
+  /// Always scanned on startup for backward compat with pre-HF-cache installs.
+  /// Also holds models.ini for llama-server.
+  static let legacyModelDir: URL = {
+    let dir = FileManager.default.homeDirectoryForCurrentUser
+      .appendingPathComponent(".llamabarn", isDirectory: true)
+    if !FileManager.default.fileExists(atPath: dir.path) {
+      try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    }
+    return dir
   }()
 
-  /// The directory where models are stored.
-  /// Returns the user-configured path if set, otherwise the default (~/.llamabarn).
-  /// Creates the directory if it doesn't exist.
-  static var modelStorageDirectory: URL {
+  // MARK: - HF Cache Directory
+
+  /// The default HF cache directory (~/.cache/huggingface/hub)
+  static let defaultHFCacheDirectory: URL = {
+    FileManager.default.homeDirectoryForCurrentUser
+      .appendingPathComponent(".cache/huggingface/hub", isDirectory: true)
+  }()
+
+  /// The HF cache directory where new model downloads are stored.
+  /// Shared with llama.cpp and other HF-aware tools.
+  /// Defaults to ~/.cache/huggingface/hub, can be overridden in Settings.
+  /// Falls back to HF_HUB_CACHE env var if set (useful when launched from terminal).
+  static var hfCacheDirectory: URL {
     get {
       let dir: URL
-      if let path = defaults.string(forKey: Keys.modelStorageDirectory) {
+      if let path = defaults.string(forKey: Keys.hfCacheDirectory) {
         dir = URL(fileURLWithPath: path, isDirectory: true)
+      } else if let envPath = ProcessInfo.processInfo.environment["HF_HUB_CACHE"] {
+        dir = URL(fileURLWithPath: envPath, isDirectory: true)
       } else {
-        dir = defaultModelStorageDirectory
+        dir = defaultHFCacheDirectory
       }
 
       // Ensure directory exists
@@ -126,25 +144,17 @@ enum UserSettings {
       return dir
     }
     set {
-      // Store nil to reset to default, otherwise store the path
-      if newValue == defaultModelStorageDirectory {
-        defaults.removeObject(forKey: Keys.modelStorageDirectory)
+      if newValue == defaultHFCacheDirectory {
+        defaults.removeObject(forKey: Keys.hfCacheDirectory)
       } else {
-        defaults.set(newValue.path, forKey: Keys.modelStorageDirectory)
+        defaults.set(newValue.path, forKey: Keys.hfCacheDirectory)
       }
     }
   }
 
-  /// Whether a custom model storage directory is configured
-  static var hasCustomModelStorageDirectory: Bool {
-    defaults.string(forKey: Keys.modelStorageDirectory) != nil
-  }
-
-  /// Whether the configured model storage directory is accessible.
-  /// Returns true if using default directory or if custom directory exists.
-  static var isModelStorageDirectoryAvailable: Bool {
-    let dir = modelStorageDirectory
-    return FileManager.default.fileExists(atPath: dir.path)
+  /// Whether a custom HF cache directory is configured
+  static var hasCustomHFCacheDirectory: Bool {
+    defaults.string(forKey: Keys.hfCacheDirectory) != nil
   }
 
   // MARK: - Hugging Face Token

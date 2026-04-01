@@ -75,55 +75,57 @@ enum HFCache {
     let commitHash: String?
   }
 
-  /// Fetches blob hash and commit hash for a file via a single HEAD request.
+  /// Fetches blob hash and commit hash for multiple files via HEAD requests.
   ///
   /// HF serves `X-Linked-Etag` (blob SHA256) and `X-Repo-Commit` (commit hash) in
   /// the response to the resolve URL. We use a same-host redirect delegate to prevent
   /// following redirects to the CDN, which would lose these headers.
-  static func fetchFileMetadata(for url: URL, token: String?) async throws -> FileMetadata {
-    var request = URLRequest(url: url)
-    request.httpMethod = "HEAD"
-    if let token {
-      request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-    }
-
-    // Use a session that blocks cross-host redirects so we get HF's headers,
-    // not the CDN's (which doesn't have X-Linked-Etag / X-Repo-Commit).
+  ///
+  /// Uses a single URLSession for all requests (sessions are heavyweight).
+  static func fetchFileMetadata(
+    for urls: [URL], token: String?
+  ) async -> [URL: FileMetadata] {
     let delegate = SameHostRedirectDelegate()
     let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
     defer { session.finishTasksAndInvalidate() }
 
-    let (_, response) = try await session.data(for: request)
+    var results: [URL: FileMetadata] = [:]
 
-    guard let httpResponse = response as? HTTPURLResponse,
-      (200...399).contains(httpResponse.statusCode)
-    else {
-      let status = (response as? HTTPURLResponse)?.statusCode ?? -1
-      throw HFCacheError.apiError("metadata fetch failed (HTTP \(status))")
+    for url in urls {
+      var request = URLRequest(url: url)
+      request.httpMethod = "HEAD"
+      if let token {
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+      }
+
+      guard let (_, response) = try? await session.data(for: request),
+        let httpResponse = response as? HTTPURLResponse,
+        (200...399).contains(httpResponse.statusCode)
+      else { continue }
+
+      // Extract blob hash from X-Linked-Etag (preferred) or ETag (fallback)
+      let blobHash: String? = {
+        if let etag = httpResponse.value(forHTTPHeaderField: "X-Linked-Etag") {
+          return etag.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+        }
+        if let etag = httpResponse.value(forHTTPHeaderField: "ETag") {
+          let cleaned =
+            etag
+            .replacingOccurrences(of: "W/", with: "")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+          // Only use if it looks like a SHA256 (64 hex chars)
+          if cleaned.count == 64, cleaned.allSatisfy({ $0.isHexDigit }) {
+            return cleaned
+          }
+        }
+        return nil
+      }()
+
+      let commitHash = httpResponse.value(forHTTPHeaderField: "X-Repo-Commit")
+      results[url] = FileMetadata(blobHash: blobHash, commitHash: commitHash)
     }
 
-    // Extract blob hash from X-Linked-Etag (preferred) or ETag (fallback)
-    let blobHash: String? = {
-      if let etag = httpResponse.value(forHTTPHeaderField: "X-Linked-Etag") {
-        return etag.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-      }
-      if let etag = httpResponse.value(forHTTPHeaderField: "ETag") {
-        let cleaned =
-          etag
-          .replacingOccurrences(of: "W/", with: "")
-          .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-        // Only use if it looks like a SHA256 (64 hex chars)
-        if cleaned.count == 64, cleaned.allSatisfy({ $0.isHexDigit }) {
-          return cleaned
-        }
-      }
-      return nil
-    }()
-
-    // Extract commit hash from X-Repo-Commit
-    let commitHash = httpResponse.value(forHTTPHeaderField: "X-Repo-Commit")
-
-    return FileMetadata(blobHash: blobHash, commitHash: commitHash)
+    return results
   }
 
   // MARK: - File Operations

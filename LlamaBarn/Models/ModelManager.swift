@@ -140,25 +140,21 @@ class ModelManager: NSObject, URLSessionDownloadDelegate {
 
     let token = await MainActor.run { UserSettings.hfToken }
 
-    var commit: String?
-    var blobHashes: [URL: String] = [:]
+    let allMetadata = await HFCache.fetchFileMetadata(
+      for: model.allDownloadUrls, token: token)
+    guard !allMetadata.isEmpty else { return nil }
 
-    // Fetch metadata for all files — each HEAD gives us both commit hash and blob hash
-    for url in model.allDownloadUrls {
-      guard let metadata = try? await HFCache.fetchFileMetadata(for: url, token: token) else {
-        continue
-      }
+    // All files in a repo share the same commit hash — take the first one we get
+    let commit = allMetadata.values.compactMap(\.commitHash).first
+    guard let commit else { return nil }
+
+    // Collect blob hashes (some may be nil if header was missing)
+    var blobHashes: [URL: String] = [:]
+    for (url, metadata) in allMetadata {
       if let hash = metadata.blobHash {
         blobHashes[url] = hash
       }
-      // All files in a repo share the same commit hash — take the first one we get
-      if commit == nil, let c = metadata.commitHash {
-        commit = c
-      }
     }
-
-    // Commit hash is required for the snapshot directory
-    guard let commit else { return nil }
 
     return HFDownloadCtx(repoDir: repoDir, commit: commit, blobHashes: blobHashes)
   }

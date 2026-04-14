@@ -44,13 +44,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         options.releaseName = AppInfo.shortVersion
         options.environment = AppInfo.shortVersion == "0.0.0" ? "internal" : "production"
 
-        // Only track HTTP errors from external services (like Hugging Face), not localhost.
-        // llama-server health checks return expected 503 responses during model loading.
-        options.failedRequestTargets = ["huggingface.co"]
+        // Disable Sentry's auto-instrumented HTTP client error capture. ModelManager
+        // already captures Hugging Face failures manually with richer context
+        // (modelId, url), and the auto-instrumentation fires repeatedly per logical
+        // failure (e.g. range request retries) creating large amounts of duplicate
+        // noise. We have no other external HTTP endpoints worth auto-capturing.
+        options.enableCaptureFailedRequests = false
 
         // Filter out non-actionable network errors globally so they don't use up quota
         options.beforeSend = { event in
-          // Check if this is a network error we want to ignore
           if let error = event.error as NSError? {
             let ignoredCodes = [
               NSURLErrorCancelled,
@@ -61,17 +63,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
               return nil  // Drop this event
             }
           }
-
-          // Drop Sentry's auto-instrumented HTTPClientError events for huggingface.co —
-          // ModelManager already captures these manually with modelId/url context, and
-          // the auto-instrumentation fires repeatedly per logical failure (e.g. range
-          // request retries) creating large amounts of duplicate noise.
-          if event.exceptions?.first?.mechanism?.type == "HTTPClientError",
-            event.request?.url?.contains("huggingface.co") == true
-          {
-            return nil
-          }
-
           return event
         }
       }
